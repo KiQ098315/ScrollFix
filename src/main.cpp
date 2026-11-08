@@ -53,7 +53,7 @@ void WFormat(wchar_t* dst, size_t cch, const wchar_t* fmt, ...) {
 }
 
 constexpr wchar_t kAppName[] = L"ScrollFix";
-constexpr wchar_t kAppVersion[] = L"1.0.0";
+constexpr wchar_t kAppVersion[] = L"1.1.0";
 constexpr wchar_t kWndClass[] = L"ScrollFixCoreWnd";
 constexpr wchar_t kUiClass[] = L"ScrollFixSettingsUI";
 constexpr wchar_t kDiagClass[] = L"ScrollFixDiagUI";
@@ -261,7 +261,10 @@ int g_holdDir = 0;
 int g_holdSum = 0;
 int g_holdCount = 0;
 DWORD g_holdStartMs = 0;
+DWORD g_holdSinceAccept = 0;
+DWORD g_stickyUntil = 0;
 bool g_injecting = false;
+constexpr UINT TIMER_HOLD = 70;
 
 std::atomic<unsigned long long> g_raw{0};
 std::atomic<unsigned long long> g_passed{0};
@@ -404,22 +407,24 @@ void PushDiag(int dir, int kind) {
     if (g_diagN < kDiagCap) ++g_diagN;
 }
 
-void BounceParams(int& bounceMs, DWORD& idleMs) {
+void BounceParams(int& bounceMs, DWORD& idleMs, DWORD& sessionMs) {
     const int sens = g_sens.load(std::memory_order_relaxed);
-    
-    
     if (sens == SensAuto) {
-        bounceMs = Clamp((int)(g_avgInterval / 3 + 18), 22, 40);
-        idleMs = Clamp(g_avgInterval * 3 + 120, 240, 400);
+        bounceMs = Clamp((int)(g_avgInterval / 3 + 24), 28, 48);
+        idleMs = Clamp(g_avgInterval * 6 + 180, 420, 700);
+        sessionMs = Clamp(g_avgInterval * 4 + 140, 280, 520);
     } else if (sens == SensSoft) {
-        bounceMs = 18;
-        idleMs = 180;
-    } else if (sens == SensAggressive) {
-        bounceMs = 36;
+        bounceMs = 24;
         idleMs = 320;
+        sessionMs = 220;
+    } else if (sens == SensAggressive) {
+        bounceMs = 44;
+        idleMs = 600;
+        sessionMs = 420;
     } else {
-        bounceMs = Clamp(g_windowMs.load(std::memory_order_relaxed) + 8, 20, 40);
-        idleMs = 260;
+        bounceMs = Clamp(g_windowMs.load(std::memory_order_relaxed) + 12, 28, 48);
+        idleMs = 480;
+        sessionMs = 320;
     }
 }
 
@@ -428,12 +433,15 @@ void ClearHold() {
     g_holdSum = 0;
     g_holdCount = 0;
     g_holdStartMs = 0;
+    g_holdSinceAccept = 0;
+    if (g_hwnd) KillTimer(g_hwnd, TIMER_HOLD);
 }
 
 void NoteSuppress(int n) {
     g_falseBurstLens = (g_falseBurstLens * 3 + (unsigned)Clamp(n, 1, 8)) / 4;
     if (g_falseBurstLens < 1) g_falseBurstLens = 1;
     g_suppressed.fetch_add((unsigned long long)Clamp(n, 1, 8), std::memory_order_relaxed);
+    g_stickyUntil = NowMs() + 180;
 }
 
 void AcceptDir(int dir, DWORD now) {
@@ -469,14 +477,63 @@ void EmitWheelNow(int delta) {
     g_injecting = false;
 }
 
-bool ConfirmRealReverse(DWORD now) {
+bool ConfirmRealReverse(DWORD now, DWORD idleMs, DWORD sessionMs) {
     if (g_holdCount <= 0) return false;
     const DWORD span = now - g_holdStartMs;
-    
-    if (g_holdCount >= 2 && span >= 16) return true;
-    if (g_holdCount >= 3 && span >= 10) return true;
+    const bool sticky = now < g_stickyUntil;
+    const bool inSession = g_holdSinceAccept < sessionMs;
+    const bool afterIdle = g_holdSinceAccept >= idleMs;
+
+    if (sticky || inSession) {
+        if (g_holdCount >= 3 && span >= 35) return true;
+        if (g_holdCount >= 4 && span >= 20) return true;
+        if (g_holdCount >= 5) return true;
+        return false;
+    }
+
+    if (afterIdle && g_holdCount >= 2 && span >= 20) return true;
+    if (g_holdCount >= 2 && span >= 50) return true;
+    if (g_holdCount >= 3 && span >= 28) return true;
     if (g_holdCount >= 4) return true;
     return false;
+}
+
+void ReleaseHoldAsReverse() {
+    if (g_holdCount <= 0) { ClearHold(); return; }
+    const int sum = g_holdSum;
+    const int dir = Sign(sum);
+    ClearHold();
+    if (sum == 0 || dir == 0) return;
+    AcceptDir(dir, NowMs());
+    EmitWheelOnce(sum);
+    PushDiag(dir, DK_Reverse);
+    g_reversed.fetch_add(1, std::memory_order_relaxed);
+    MaybePostUi();
+}
+
+void OnHoldTimeout() {
+    if (g_holdCount <= 0) { ClearHold(); return; }
+    int bounceMs = 28;
+    DWORD idleMs = 480, sessionMs = 320;
+    BounceParams(bounceMs, idleMs, sessionMs);
+    (void)bounceMs;
+    const DWORD now = NowMs();
+    const DWORD span = now - g_holdStartMs;
+    const bool sticky = now < g_stickyUntil;
+    const bool inSession = g_holdSinceAccept < sessionMs;
+
+    if (g_holdSinceAccept >= idleMs) {
+        ReleaseHoldAsReverse();
+        return;
+    }
+    if (!sticky && !inSession && g_holdCount >= 2 && span >= 35) {
+        ReleaseHoldAsReverse();
+        return;
+    }
+    NoteSuppress(g_holdCount);
+    for (int i = 0; i < g_holdCount && i < 6; ++i) PushDiag(g_holdDir, DK_Suppress);
+    ClearHold();
+    MaybePostUi();
 }
 
 bool FilterWheel(int delta) {
@@ -495,8 +552,8 @@ bool FilterWheel(int delta) {
     }
 
     int bounceMs = 28;
-    DWORD idleMs = 260;
-    BounceParams(bounceMs, idleMs);
+    DWORD idleMs = 480, sessionMs = 320;
+    BounceParams(bounceMs, idleMs, sessionMs);
     const DWORD since = (g_lastAcceptMs == 0) ? 100000u : (now - g_lastAcceptMs);
 
     if (g_dir == 0) {
@@ -506,7 +563,6 @@ bool FilterWheel(int delta) {
         return true;
     }
 
-    
     if (dir == g_dir) {
         if (g_holdCount > 0) {
             NoteSuppress(g_holdCount);
@@ -519,20 +575,7 @@ bool FilterWheel(int delta) {
         return true;
     }
 
-    
-    
-    if (since >= idleMs) {
-        ClearHold();
-        AcceptDir(dir, now);
-        PushDiag(dir, DK_Reverse);
-        g_passed.fetch_add(1, std::memory_order_relaxed);
-        g_reversed.fetch_add(1, std::memory_order_relaxed);
-        return true;
-    }
-
-    
     if (g_holdCount > 0 && dir != g_holdDir) {
-        
         NoteSuppress(g_holdCount);
         ClearHold();
     }
@@ -542,36 +585,21 @@ bool FilterWheel(int delta) {
         g_holdSum = delta;
         g_holdCount = 1;
         g_holdStartMs = now;
+        g_holdSinceAccept = since;
         PushDiag(dir, DK_Suspect);
-        return false; 
-    }
-
-    
-    g_holdSum += delta;
-    ++g_holdCount;
-    PushDiag(dir, DK_Suspect);
-
-    if (ConfirmRealReverse(now)) {
-        const int sum = g_holdSum;
-        const int n = g_holdCount;
-        ClearHold();
-        AcceptDir(dir, now);
-        
-        EmitWheelOnce(sum);
-        PushDiag(dir, DK_Reverse);
-        g_reversed.fetch_add(1, std::memory_order_relaxed);
-        (void)n;
-        return false; 
-    }
-
-    
-    
-    if (since > (DWORD)bounceMs * 2 && g_holdCount == 1) {
-        
-        
+        if (g_hwnd) SetTimer(g_hwnd, TIMER_HOLD, since >= idleMs ? 28 : (UINT)Clamp(bounceMs + 8, 28, 55), nullptr);
         return false;
     }
 
+    g_holdSum += delta;
+    ++g_holdCount;
+    PushDiag(dir, DK_Suspect);
+    if (g_hwnd) SetTimer(g_hwnd, TIMER_HOLD, (UINT)Clamp(bounceMs + 8, 28, 55), nullptr);
+
+    if (ConfirmRealReverse(now, idleMs, sessionMs)) {
+        ReleaseHoldAsReverse();
+        return false;
+    }
     return false;
 }
 
@@ -1160,6 +1188,12 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_EMIT_WHEEL:
         EmitWheelNow((int)wParam);
+        return 0;
+    case WM_TIMER:
+        if (wParam == TIMER_HOLD) {
+            KillTimer(hwnd, TIMER_HOLD);
+            OnHoldTimeout();
+        }
         return 0;
     case WM_TRAY:
         if (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU) ShowTrayMenu(hwnd);
