@@ -53,7 +53,7 @@ void WFormat(wchar_t* dst, size_t cch, const wchar_t* fmt, ...) {
 }
 
 constexpr wchar_t kAppName[] = L"ScrollFix";
-constexpr wchar_t kAppVersion[] = L"1.2.0";
+constexpr wchar_t kAppVersion[] = L"1.3.0";
 constexpr wchar_t kWndClass[] = L"ScrollFixCoreWnd";
 constexpr wchar_t kUiClass[] = L"ScrollFixSettingsUI";
 constexpr wchar_t kDiagClass[] = L"ScrollFixDiagUI";
@@ -274,10 +274,14 @@ constexpr UINT TIMER_HOLD = 70;
 struct BtnFixState {
     DWORD lastDownMs = 0;
     DWORD lastUpMs = 0;
+    bool logicalDown = false;
     bool suppressUp = false;
+    bool pendingShortUp = false;
 };
 BtnFixState g_lBtn{};
 BtnFixState g_rBtn{};
+constexpr UINT TIMER_CLICK_L = 71;
+constexpr UINT TIMER_CLICK_R = 72;
 
 std::atomic<unsigned long long> g_raw{0};
 std::atomic<unsigned long long> g_passed{0};
@@ -426,38 +430,38 @@ void PushDiag(int dir, int kind) {
 void BounceParams(int& bounceMs, DWORD& idleMs, DWORD& sessionMs) {
     const int sens = g_sens.load(std::memory_order_relaxed);
     if (sens == SensAuto) {
-        bounceMs = Clamp((int)(g_avgInterval / 3 + 30), 34, 56);
-        idleMs = Clamp(g_avgInterval * 8 + 260, 560, 980);
-        sessionMs = Clamp(g_avgInterval * 5 + 200, 360, 720);
+        bounceMs = Clamp((int)(g_avgInterval / 4 + 18), 18, 36);
+        idleMs = Clamp(g_avgInterval * 5 + 160, 320, 560);
+        sessionMs = Clamp(g_avgInterval * 3 + 100, 180, 360);
     } else if (sens == SensSoft) {
-        bounceMs = 28;
-        idleMs = 420;
-        sessionMs = 280;
+        bounceMs = 14;
+        idleMs = 260;
+        sessionMs = 140;
     } else if (sens == SensAggressive) {
-        bounceMs = 52;
-        idleMs = 820;
-        sessionMs = 560;
+        bounceMs = 30;
+        idleMs = 480;
+        sessionMs = 280;
     } else {
-        bounceMs = Clamp(g_windowMs.load(std::memory_order_relaxed) + 18, 34, 56);
-        idleMs = 640;
-        sessionMs = 420;
+        bounceMs = Clamp(g_windowMs.load(std::memory_order_relaxed) + 6, 18, 36);
+        idleMs = 380;
+        sessionMs = 220;
     }
 }
 
-void ClickParams(DWORD& bounceMs, DWORD& minGapMs) {
+void ClickParams(DWORD& bounceAfterUpMs, DWORD& minPressMs) {
     const int sens = g_sens.load(std::memory_order_relaxed);
     if (sens == SensSoft) {
-        bounceMs = 35;
-        minGapMs = 70;
+        bounceAfterUpMs = 40;
+        minPressMs = 12;
     } else if (sens == SensAggressive) {
-        bounceMs = 65;
-        minGapMs = 120;
+        bounceAfterUpMs = 70;
+        minPressMs = 22;
     } else if (sens == SensMedium) {
-        bounceMs = 50;
-        minGapMs = 95;
+        bounceAfterUpMs = 55;
+        minPressMs = 16;
     } else {
-        bounceMs = 45;
-        minGapMs = 90;
+        bounceAfterUpMs = 50;
+        minPressMs = 15;
     }
 }
 
@@ -474,7 +478,7 @@ void NoteSuppress(int n) {
     g_falseBurstLens = (g_falseBurstLens * 3 + (unsigned)Clamp(n, 1, 8)) / 4;
     if (g_falseBurstLens < 1) g_falseBurstLens = 1;
     g_suppressed.fetch_add((unsigned long long)Clamp(n, 1, 8), std::memory_order_relaxed);
-    g_stickyUntil = NowMs() + 320;
+    g_stickyUntil = NowMs() + 140;
 }
 
 void AcceptDir(int dir, DWORD now) {
@@ -514,24 +518,26 @@ bool ConfirmRealReverse(DWORD now, DWORD idleMs, DWORD sessionMs) {
     if (g_holdCount <= 0) return false;
     const DWORD span = now - g_holdStartMs;
     const bool sticky = now < g_stickyUntil;
-    const bool inSession = g_holdSinceAccept < sessionMs || g_streak >= 2;
+    const bool inSession = g_holdSinceAccept < sessionMs;
     const bool afterIdle = g_holdSinceAccept >= idleMs;
 
-    if (sticky || inSession) {
-        if (g_holdCount >= 4 && span >= 55) return true;
-        if (g_holdCount >= 5 && span >= 35) return true;
-        if (g_holdCount >= 6) return true;
-        return false;
-    }
-
     if (afterIdle) {
-        if (g_holdCount >= 2 && span >= 45) return true;
-        if (g_holdCount >= 3 && span >= 28) return true;
+        if (g_holdCount >= 1 && span >= 12) return true;
+        if (g_holdCount >= 2) return true;
         return false;
     }
-
-    if (g_holdCount >= 3 && span >= 50) return true;
-    if (g_holdCount >= 4 && span >= 35) return true;
+    if (sticky) {
+        if (g_holdCount >= 3 && span >= 28) return true;
+        if (g_holdCount >= 4) return true;
+        return false;
+    }
+    if (inSession) {
+        if (g_holdCount >= 2 && span >= 20) return true;
+        if (g_holdCount >= 3) return true;
+        return false;
+    }
+    if (g_holdCount >= 2 && span >= 24) return true;
+    if (g_holdCount >= 3) return true;
     return false;
 }
 
@@ -550,28 +556,25 @@ void ReleaseHoldAsReverse() {
 
 void OnHoldTimeout() {
     if (g_holdCount <= 0) { ClearHold(); return; }
-    int bounceMs = 34;
-    DWORD idleMs = 640, sessionMs = 420;
+    int bounceMs = 22;
+    DWORD idleMs = 380, sessionMs = 220;
     BounceParams(bounceMs, idleMs, sessionMs);
     (void)bounceMs;
     const DWORD now = NowMs();
     const DWORD span = now - g_holdStartMs;
     const bool sticky = now < g_stickyUntil;
-    const bool inSession = g_holdSinceAccept < sessionMs || g_streak >= 2;
+    const bool inSession = g_holdSinceAccept < sessionMs;
+    const bool afterIdle = g_holdSinceAccept >= idleMs;
 
-    if (g_holdCount <= 1) {
-        NoteSuppress(g_holdCount);
-        PushDiag(g_holdDir, DK_Suppress);
-        ClearHold();
-        MaybePostUi();
-        return;
-    }
-
-    if (!sticky && !inSession && g_holdSinceAccept >= idleMs && g_holdCount >= 2 && span >= 40) {
+    if (afterIdle) {
         ReleaseHoldAsReverse();
         return;
     }
-    if (!sticky && !inSession && g_holdCount >= 3 && span >= 45) {
+    if (!sticky && g_holdCount >= 2 && span >= 18) {
+        ReleaseHoldAsReverse();
+        return;
+    }
+    if (!sticky && !inSession && g_holdCount >= 1 && span >= (DWORD)Clamp(bounceMs, 18, 40)) {
         ReleaseHoldAsReverse();
         return;
     }
@@ -581,23 +584,55 @@ void OnHoldTimeout() {
     MaybePostUi();
 }
 
-bool FilterButton(BtnFixState& st, bool isDown) {
-    if (!g_clickFix.load(std::memory_order_relaxed)) return true;
+void EmitButtonUp(bool left) {
+    g_injecting = true;
+    INPUT in{};
+    in.type = INPUT_MOUSE;
+    in.mi.dwFlags = left ? MOUSEEVENTF_LEFTUP : MOUSEEVENTF_RIGHTUP;
+    SendInput(1, &in, sizeof(INPUT));
+    g_injecting = false;
+}
+
+void OnClickTimeout(BtnFixState& st, bool left, UINT timerId) {
+    if (g_hwnd) KillTimer(g_hwnd, timerId);
+    if (!st.pendingShortUp) return;
+    st.pendingShortUp = false;
+    if (!st.logicalDown) return;
+    st.logicalDown = false;
+    st.lastUpMs = NowMs();
+    EmitButtonUp(left);
+}
+
+bool FilterButton(BtnFixState& st, bool isDown, bool left) {
+    if (!g_clickFix.load(std::memory_order_relaxed)) {
+        st.logicalDown = false;
+        st.suppressUp = false;
+        st.pendingShortUp = false;
+        return true;
+    }
+
     const DWORD now = NowMs();
-    DWORD bounceMs = 45, minGapMs = 90;
-    ClickParams(bounceMs, minGapMs);
+    DWORD bounceAfterUpMs = 50, minPressMs = 15;
+    ClickParams(bounceAfterUpMs, minPressMs);
+    const UINT timerId = left ? TIMER_CLICK_L : TIMER_CLICK_R;
 
     if (isDown) {
-        if (st.lastUpMs != 0 && (now - st.lastUpMs) < bounceMs) {
+        if (st.pendingShortUp) {
+            st.pendingShortUp = false;
+            if (g_hwnd) KillTimer(g_hwnd, timerId);
+            g_clickSuppressed.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        if (st.logicalDown) {
+            g_clickSuppressed.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        if (st.lastUpMs != 0 && (now - st.lastUpMs) < bounceAfterUpMs) {
             st.suppressUp = true;
             g_clickSuppressed.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
-        if (st.lastDownMs != 0 && (now - st.lastDownMs) < minGapMs) {
-            st.suppressUp = true;
-            g_clickSuppressed.fetch_add(1, std::memory_order_relaxed);
-            return false;
-        }
+        st.logicalDown = true;
         st.lastDownMs = now;
         st.suppressUp = false;
         return true;
@@ -607,6 +642,19 @@ bool FilterButton(BtnFixState& st, bool isDown) {
         st.suppressUp = false;
         return false;
     }
+    if (!st.logicalDown) return false;
+
+    const DWORD pressDur = now - st.lastDownMs;
+    if (pressDur < minPressMs) {
+        st.pendingShortUp = true;
+        g_clickSuppressed.fetch_add(1, std::memory_order_relaxed);
+        if (g_hwnd) SetTimer(g_hwnd, timerId, bounceAfterUpMs + 10, nullptr);
+        return false;
+    }
+
+    st.logicalDown = false;
+    st.pendingShortUp = false;
+    if (g_hwnd) KillTimer(g_hwnd, timerId);
     st.lastUpMs = now;
     return true;
 }
@@ -626,8 +674,8 @@ bool FilterWheel(int delta) {
         return true;
     }
 
-    int bounceMs = 34;
-    DWORD idleMs = 640, sessionMs = 420;
+    int bounceMs = 22;
+    DWORD idleMs = 380, sessionMs = 220;
     BounceParams(bounceMs, idleMs, sessionMs);
     const DWORD since = (g_lastAcceptMs == 0) ? 100000u : (now - g_lastAcceptMs);
 
@@ -662,7 +710,9 @@ bool FilterWheel(int delta) {
         g_holdStartMs = now;
         g_holdSinceAccept = since;
         PushDiag(dir, DK_Suspect);
-        const UINT holdMs = (UINT)Clamp(bounceMs + 12, 36, 70);
+        const UINT holdMs = since >= idleMs
+            ? (UINT)16
+            : (UINT)Clamp(bounceMs, 16, 40);
         if (g_hwnd) SetTimer(g_hwnd, TIMER_HOLD, holdMs, nullptr);
         return false;
     }
@@ -670,7 +720,7 @@ bool FilterWheel(int delta) {
     g_holdSum += delta;
     ++g_holdCount;
     PushDiag(dir, DK_Suspect);
-    if (g_hwnd) SetTimer(g_hwnd, TIMER_HOLD, (UINT)Clamp(bounceMs + 12, 36, 70), nullptr);
+    if (g_hwnd) SetTimer(g_hwnd, TIMER_HOLD, (UINT)Clamp(bounceMs, 16, 40), nullptr);
 
     if (ConfirmRealReverse(now, idleMs, sessionMs)) {
         ReleaseHoldAsReverse();
@@ -690,11 +740,11 @@ LRESULT CALLBACK LowLevelMouseProc(int code, WPARAM wParam, LPARAM lParam) {
     }
 
     if (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP) {
-        if (!FilterButton(g_lBtn, wParam == WM_LBUTTONDOWN)) return 1;
+        if (!FilterButton(g_lBtn, wParam == WM_LBUTTONDOWN, true)) return 1;
         return CallNextHookEx(g_hook, code, wParam, lParam);
     }
     if (wParam == WM_RBUTTONDOWN || wParam == WM_RBUTTONUP) {
-        if (!FilterButton(g_rBtn, wParam == WM_RBUTTONDOWN)) return 1;
+        if (!FilterButton(g_rBtn, wParam == WM_RBUTTONDOWN, false)) return 1;
         return CallNextHookEx(g_hook, code, wParam, lParam);
     }
 
@@ -1289,6 +1339,10 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (wParam == TIMER_HOLD) {
             KillTimer(hwnd, TIMER_HOLD);
             OnHoldTimeout();
+        } else if (wParam == TIMER_CLICK_L) {
+            OnClickTimeout(g_lBtn, true, TIMER_CLICK_L);
+        } else if (wParam == TIMER_CLICK_R) {
+            OnClickTimeout(g_rBtn, false, TIMER_CLICK_R);
         }
         return 0;
     case WM_TRAY:
@@ -1298,6 +1352,8 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_CLOSE: DestroyWindow(hwnd); return 0;
     case WM_DESTROY:
         ClearHold();
+        KillTimer(hwnd, TIMER_CLICK_L);
+        KillTimer(hwnd, TIMER_CLICK_R);
         if (g_settingsWnd) DestroyWindow(g_settingsWnd);
         if (g_diagWnd) DestroyWindow(g_diagWnd);
         RemoveTrayIcon();
