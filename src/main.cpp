@@ -53,7 +53,7 @@ void WFormat(wchar_t* dst, size_t cch, const wchar_t* fmt, ...) {
 }
 
 constexpr wchar_t kAppName[] = L"ScrollFix";
-constexpr wchar_t kAppVersion[] = L"1.1.0";
+constexpr wchar_t kAppVersion[] = L"1.2.0";
 constexpr wchar_t kWndClass[] = L"ScrollFixCoreWnd";
 constexpr wchar_t kUiClass[] = L"ScrollFixSettingsUI";
 constexpr wchar_t kDiagClass[] = L"ScrollFixDiagUI";
@@ -83,6 +83,7 @@ struct UiText {
     const wchar_t* subtitle;
     const wchar_t* filter;
     const wchar_t* autostart;
+    const wchar_t* clickFix;
     const wchar_t* sensitivity;
     const wchar_t* sensAuto;
     const wchar_t* sensSoft;
@@ -104,9 +105,10 @@ struct UiText {
 constexpr UiText kRu{
     L"ScrollFix уже запущен.",
     L"Не удалось установить хук мыши.",
-    L"Убирает ложные скроллы сломанного колёсика",
-    L"Фильтр",
+    L"Фильтр ложных скроллов и даблкликов",
+    L"Фильтр скролла",
     L"Автозапуск",
+    L"Фикс даблклика",
     L"Чувствительность",
     L"Авто",
     L"Мягкая",
@@ -128,9 +130,10 @@ constexpr UiText kRu{
 constexpr UiText kEn{
     L"ScrollFix is already running.",
     L"Failed to install mouse hook.",
-    L"Removes false scrolls from a faulty mouse wheel",
-    L"Filter",
+    L"Filters false scrolls and double-clicks",
+    L"Scroll filter",
     L"Start with Windows",
+    L"Double-click fix",
     L"Sensitivity",
     L"Auto",
     L"Soft",
@@ -169,17 +172,19 @@ enum SensMode : int { SensAuto = 0, SensSoft = 1, SensMedium = 2, SensAggressive
 struct Settings {
     bool enabled = true;
     bool autostart = false;
+    bool clickFix = true;
     bool logging = false;
     int sens = SensAuto;
     int lang = LangRu;
-    int windowMs = 20;      
-    int minStreak = 2;      
-    int reverseConfirm = 4; 
+    int windowMs = 20;
+    int minStreak = 2;
+    int reverseConfirm = 4;
 };
 
 Settings g_settings;
 const UiText& T() { return (g_settings.lang == LangEn) ? kEn : kRu; }
 std::atomic<bool> g_enabled{true};
+std::atomic<bool> g_clickFix{true};
 std::atomic<int> g_sens{SensAuto};
 std::atomic<int> g_windowMs{20};
 std::atomic<int> g_minStreak{2};
@@ -266,10 +271,19 @@ DWORD g_stickyUntil = 0;
 bool g_injecting = false;
 constexpr UINT TIMER_HOLD = 70;
 
+struct BtnFixState {
+    DWORD lastDownMs = 0;
+    DWORD lastUpMs = 0;
+    bool suppressUp = false;
+};
+BtnFixState g_lBtn{};
+BtnFixState g_rBtn{};
+
 std::atomic<unsigned long long> g_raw{0};
 std::atomic<unsigned long long> g_passed{0};
 std::atomic<unsigned long long> g_suppressed{0};
 std::atomic<unsigned long long> g_reversed{0};
+std::atomic<unsigned long long> g_clickSuppressed{0};
 DWORD g_lastUiPostMs = 0;
 
 enum DiagKind : int { DK_Pass = 1, DK_Suppress = 2, DK_Suspect = 3, DK_Reverse = 4 };
@@ -292,7 +306,7 @@ bool GetExePath(wchar_t* out, DWORD cch) {
 
 void LogLine(const wchar_t* line) {
     if (!g_logging.load(std::memory_order_relaxed) || !g_logFile) return;
-    fwprintf(g_logFile, L"%s\n", line);
+    fwprintf(g_logFile, L"%ls\n", line);
 }
 
 void OpenLogIfNeeded() {
@@ -327,6 +341,7 @@ void LoadSettings() {
     };
     g_settings.enabled = rd(L"Enabled", 1) != 0;
     g_settings.autostart = rd(L"Autostart", 0) != 0;
+    g_settings.clickFix = rd(L"ClickFix", 1) != 0;
     g_settings.logging = rd(L"Logging", 0) != 0;
     g_settings.sens = Clamp((int)rd(L"Sens", SensAuto), 0, 3);
     g_settings.lang = Clamp((int)rd(L"Lang", LangRu), 0, 1);
@@ -345,6 +360,7 @@ void SaveSettings() {
     };
     wr(L"Enabled", g_settings.enabled ? 1 : 0);
     wr(L"Autostart", g_settings.autostart ? 1 : 0);
+    wr(L"ClickFix", g_settings.clickFix ? 1 : 0);
     wr(L"Logging", g_settings.logging ? 1 : 0);
     wr(L"Sens", (DWORD)g_settings.sens);
     wr(L"Lang", (DWORD)g_settings.lang);
@@ -356,11 +372,11 @@ void SaveSettings() {
 
 void ApplyRuntime() {
     g_enabled.store(g_settings.enabled, std::memory_order_relaxed);
+    g_clickFix.store(g_settings.clickFix, std::memory_order_relaxed);
     g_sens.store(g_settings.sens, std::memory_order_relaxed);
     g_windowMs.store(g_settings.windowMs, std::memory_order_relaxed);
     g_minStreak.store(g_settings.minStreak, std::memory_order_relaxed);
     g_reverseConfirm.store(g_settings.reverseConfirm, std::memory_order_relaxed);
-    
     g_logging.store(g_settings.logging, std::memory_order_relaxed);
     if (g_settings.logging) OpenLogIfNeeded();
     else CloseLog();
@@ -373,7 +389,7 @@ void SetAutostart(bool enable) {
         wchar_t path[MAX_PATH]{};
         if (GetExePath(path, MAX_PATH)) {
             wchar_t quoted[MAX_PATH + 4]{};
-            WFormat(quoted, MAX_PATH + 4, L"\"%s\"", path);
+            WFormat(quoted, MAX_PATH + 4, L"\"%ls\"", path);
             RegSetValueExW(key, kAppName, 0, REG_SZ, reinterpret_cast<const BYTE*>(quoted),
                            (DWORD)((wcslen(quoted) + 1) * sizeof(wchar_t)));
         }
@@ -410,21 +426,38 @@ void PushDiag(int dir, int kind) {
 void BounceParams(int& bounceMs, DWORD& idleMs, DWORD& sessionMs) {
     const int sens = g_sens.load(std::memory_order_relaxed);
     if (sens == SensAuto) {
-        bounceMs = Clamp((int)(g_avgInterval / 3 + 24), 28, 48);
-        idleMs = Clamp(g_avgInterval * 6 + 180, 420, 700);
-        sessionMs = Clamp(g_avgInterval * 4 + 140, 280, 520);
+        bounceMs = Clamp((int)(g_avgInterval / 3 + 30), 34, 56);
+        idleMs = Clamp(g_avgInterval * 8 + 260, 560, 980);
+        sessionMs = Clamp(g_avgInterval * 5 + 200, 360, 720);
     } else if (sens == SensSoft) {
-        bounceMs = 24;
-        idleMs = 320;
-        sessionMs = 220;
+        bounceMs = 28;
+        idleMs = 420;
+        sessionMs = 280;
     } else if (sens == SensAggressive) {
-        bounceMs = 44;
-        idleMs = 600;
-        sessionMs = 420;
+        bounceMs = 52;
+        idleMs = 820;
+        sessionMs = 560;
     } else {
-        bounceMs = Clamp(g_windowMs.load(std::memory_order_relaxed) + 12, 28, 48);
-        idleMs = 480;
-        sessionMs = 320;
+        bounceMs = Clamp(g_windowMs.load(std::memory_order_relaxed) + 18, 34, 56);
+        idleMs = 640;
+        sessionMs = 420;
+    }
+}
+
+void ClickParams(DWORD& bounceMs, DWORD& minGapMs) {
+    const int sens = g_sens.load(std::memory_order_relaxed);
+    if (sens == SensSoft) {
+        bounceMs = 35;
+        minGapMs = 70;
+    } else if (sens == SensAggressive) {
+        bounceMs = 65;
+        minGapMs = 120;
+    } else if (sens == SensMedium) {
+        bounceMs = 50;
+        minGapMs = 95;
+    } else {
+        bounceMs = 45;
+        minGapMs = 90;
     }
 }
 
@@ -441,7 +474,7 @@ void NoteSuppress(int n) {
     g_falseBurstLens = (g_falseBurstLens * 3 + (unsigned)Clamp(n, 1, 8)) / 4;
     if (g_falseBurstLens < 1) g_falseBurstLens = 1;
     g_suppressed.fetch_add((unsigned long long)Clamp(n, 1, 8), std::memory_order_relaxed);
-    g_stickyUntil = NowMs() + 180;
+    g_stickyUntil = NowMs() + 320;
 }
 
 void AcceptDir(int dir, DWORD now) {
@@ -481,20 +514,24 @@ bool ConfirmRealReverse(DWORD now, DWORD idleMs, DWORD sessionMs) {
     if (g_holdCount <= 0) return false;
     const DWORD span = now - g_holdStartMs;
     const bool sticky = now < g_stickyUntil;
-    const bool inSession = g_holdSinceAccept < sessionMs;
+    const bool inSession = g_holdSinceAccept < sessionMs || g_streak >= 2;
     const bool afterIdle = g_holdSinceAccept >= idleMs;
 
     if (sticky || inSession) {
-        if (g_holdCount >= 3 && span >= 35) return true;
-        if (g_holdCount >= 4 && span >= 20) return true;
-        if (g_holdCount >= 5) return true;
+        if (g_holdCount >= 4 && span >= 55) return true;
+        if (g_holdCount >= 5 && span >= 35) return true;
+        if (g_holdCount >= 6) return true;
         return false;
     }
 
-    if (afterIdle && g_holdCount >= 2 && span >= 20) return true;
-    if (g_holdCount >= 2 && span >= 50) return true;
-    if (g_holdCount >= 3 && span >= 28) return true;
-    if (g_holdCount >= 4) return true;
+    if (afterIdle) {
+        if (g_holdCount >= 2 && span >= 45) return true;
+        if (g_holdCount >= 3 && span >= 28) return true;
+        return false;
+    }
+
+    if (g_holdCount >= 3 && span >= 50) return true;
+    if (g_holdCount >= 4 && span >= 35) return true;
     return false;
 }
 
@@ -513,20 +550,28 @@ void ReleaseHoldAsReverse() {
 
 void OnHoldTimeout() {
     if (g_holdCount <= 0) { ClearHold(); return; }
-    int bounceMs = 28;
-    DWORD idleMs = 480, sessionMs = 320;
+    int bounceMs = 34;
+    DWORD idleMs = 640, sessionMs = 420;
     BounceParams(bounceMs, idleMs, sessionMs);
     (void)bounceMs;
     const DWORD now = NowMs();
     const DWORD span = now - g_holdStartMs;
     const bool sticky = now < g_stickyUntil;
-    const bool inSession = g_holdSinceAccept < sessionMs;
+    const bool inSession = g_holdSinceAccept < sessionMs || g_streak >= 2;
 
-    if (g_holdSinceAccept >= idleMs) {
+    if (g_holdCount <= 1) {
+        NoteSuppress(g_holdCount);
+        PushDiag(g_holdDir, DK_Suppress);
+        ClearHold();
+        MaybePostUi();
+        return;
+    }
+
+    if (!sticky && !inSession && g_holdSinceAccept >= idleMs && g_holdCount >= 2 && span >= 40) {
         ReleaseHoldAsReverse();
         return;
     }
-    if (!sticky && !inSession && g_holdCount >= 2 && span >= 35) {
+    if (!sticky && !inSession && g_holdCount >= 3 && span >= 45) {
         ReleaseHoldAsReverse();
         return;
     }
@@ -534,6 +579,36 @@ void OnHoldTimeout() {
     for (int i = 0; i < g_holdCount && i < 6; ++i) PushDiag(g_holdDir, DK_Suppress);
     ClearHold();
     MaybePostUi();
+}
+
+bool FilterButton(BtnFixState& st, bool isDown) {
+    if (!g_clickFix.load(std::memory_order_relaxed)) return true;
+    const DWORD now = NowMs();
+    DWORD bounceMs = 45, minGapMs = 90;
+    ClickParams(bounceMs, minGapMs);
+
+    if (isDown) {
+        if (st.lastUpMs != 0 && (now - st.lastUpMs) < bounceMs) {
+            st.suppressUp = true;
+            g_clickSuppressed.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        if (st.lastDownMs != 0 && (now - st.lastDownMs) < minGapMs) {
+            st.suppressUp = true;
+            g_clickSuppressed.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        st.lastDownMs = now;
+        st.suppressUp = false;
+        return true;
+    }
+
+    if (st.suppressUp) {
+        st.suppressUp = false;
+        return false;
+    }
+    st.lastUpMs = now;
+    return true;
 }
 
 bool FilterWheel(int delta) {
@@ -551,8 +626,8 @@ bool FilterWheel(int delta) {
         return true;
     }
 
-    int bounceMs = 28;
-    DWORD idleMs = 480, sessionMs = 320;
+    int bounceMs = 34;
+    DWORD idleMs = 640, sessionMs = 420;
     BounceParams(bounceMs, idleMs, sessionMs);
     const DWORD since = (g_lastAcceptMs == 0) ? 100000u : (now - g_lastAcceptMs);
 
@@ -587,14 +662,15 @@ bool FilterWheel(int delta) {
         g_holdStartMs = now;
         g_holdSinceAccept = since;
         PushDiag(dir, DK_Suspect);
-        if (g_hwnd) SetTimer(g_hwnd, TIMER_HOLD, since >= idleMs ? 28 : (UINT)Clamp(bounceMs + 8, 28, 55), nullptr);
+        const UINT holdMs = (UINT)Clamp(bounceMs + 12, 36, 70);
+        if (g_hwnd) SetTimer(g_hwnd, TIMER_HOLD, holdMs, nullptr);
         return false;
     }
 
     g_holdSum += delta;
     ++g_holdCount;
     PushDiag(dir, DK_Suspect);
-    if (g_hwnd) SetTimer(g_hwnd, TIMER_HOLD, (UINT)Clamp(bounceMs + 8, 28, 55), nullptr);
+    if (g_hwnd) SetTimer(g_hwnd, TIMER_HOLD, (UINT)Clamp(bounceMs + 12, 36, 70), nullptr);
 
     if (ConfirmRealReverse(now, idleMs, sessionMs)) {
         ReleaseHoldAsReverse();
@@ -604,16 +680,25 @@ bool FilterWheel(int delta) {
 }
 
 LRESULT CALLBACK LowLevelMouseProc(int code, WPARAM wParam, LPARAM lParam) {
-    
     if (code != HC_ACTION) {
-        return CallNextHookEx(g_hook, code, wParam, lParam);
-    }
-    if (wParam != WM_MOUSEWHEEL) {
         return CallNextHookEx(g_hook, code, wParam, lParam);
     }
 
     const auto* info = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
     if (g_injecting || (info->flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED))) {
+        return CallNextHookEx(g_hook, code, wParam, lParam);
+    }
+
+    if (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP) {
+        if (!FilterButton(g_lBtn, wParam == WM_LBUTTONDOWN)) return 1;
+        return CallNextHookEx(g_hook, code, wParam, lParam);
+    }
+    if (wParam == WM_RBUTTONDOWN || wParam == WM_RBUTTONUP) {
+        if (!FilterButton(g_rBtn, wParam == WM_RBUTTONDOWN)) return 1;
+        return CallNextHookEx(g_hook, code, wParam, lParam);
+    }
+
+    if (wParam != WM_MOUSEWHEEL) {
         return CallNextHookEx(g_hook, code, wParam, lParam);
     }
 
@@ -716,7 +801,7 @@ HICON CreateTrayIcon() {
 
 void UpdateTrayTip() {
     if (!g_trayAdded) return;
-    WFormat(g_nid.szTip, 128, L"ScrollFix [%s]", g_settings.enabled ? L"ON" : L"OFF");
+    WFormat(g_nid.szTip, 128, L"ScrollFix [%ls]", g_settings.enabled ? L"ON" : L"OFF");
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
 }
 
@@ -742,10 +827,10 @@ void RemoveTrayIcon() {
 }
 
 constexpr int kUiW = 380;
-constexpr int kUiH = 350;
+constexpr int kUiH = 396;
 
 enum SHit {
-    SH_None, SH_Close, SH_Enable, SH_Auto,
+    SH_None, SH_Close, SH_Enable, SH_Auto, SH_Click,
     SH_Sens0, SH_Sens1, SH_Sens2, SH_Sens3,
     SH_LangRu, SH_LangEn, SH_Save, SH_Diag
 };
@@ -754,21 +839,23 @@ bool g_sDrag = false;
 POINT g_sDragPt{};
 
 RECT SClose() { return RR(SX(kUiW - 34), SX(10), SX(22), SX(22)); }
-RECT SEnable() { return RR(SX(20), SX(86), SX(38), SX(20)); }
-RECT SAuto() { return RR(SX(20), SX(122), SX(38), SX(20)); }
-RECT SSens0() { return RR(SX(20), SX(188), SX(78), SX(28)); }
-RECT SSens1() { return RR(SX(104), SX(188), SX(78), SX(28)); }
-RECT SSens2() { return RR(SX(188), SX(188), SX(78), SX(28)); }
-RECT SSens3() { return RR(SX(272), SX(188), SX(88), SX(28)); }
-RECT SLangRu() { return RR(SX(20), SX(240), SX(52), SX(24)); }
-RECT SLangEn() { return RR(SX(78), SX(240), SX(52), SX(24)); }
-RECT SSave() { return RR(SX(20), SX(286), SX(162), SX(34)); }
-RECT SDiag() { return RR(SX(198), SX(286), SX(162), SX(34)); }
+RECT SEnable() { return RR(SX(20), SX(82), SX(38), SX(20)); }
+RECT SAuto() { return RR(SX(20), SX(116), SX(38), SX(20)); }
+RECT SClick() { return RR(SX(20), SX(150), SX(38), SX(20)); }
+RECT SSens0() { return RR(SX(20), SX(220), SX(78), SX(28)); }
+RECT SSens1() { return RR(SX(104), SX(220), SX(78), SX(28)); }
+RECT SSens2() { return RR(SX(188), SX(220), SX(78), SX(28)); }
+RECT SSens3() { return RR(SX(272), SX(220), SX(88), SX(28)); }
+RECT SLangRu() { return RR(SX(20), SX(276), SX(52), SX(24)); }
+RECT SLangEn() { return RR(SX(78), SX(276), SX(52), SX(24)); }
+RECT SSave() { return RR(SX(20), SX(330), SX(162), SX(34)); }
+RECT SDiag() { return RR(SX(198), SX(330), SX(162), SX(34)); }
 
 int SHitTest(int x, int y) {
     if (PtIn(SClose(), x, y)) return SH_Close;
     if (PtIn(SEnable(), x, y)) return SH_Enable;
     if (PtIn(SAuto(), x, y)) return SH_Auto;
+    if (PtIn(SClick(), x, y)) return SH_Click;
     if (PtIn(SSens0(), x, y)) return SH_Sens0;
     if (PtIn(SSens1(), x, y)) return SH_Sens1;
     if (PtIn(SSens2(), x, y)) return SH_Sens2;
@@ -901,17 +988,20 @@ void PaintSettings(HWND hwnd) {
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     DrawCloseBtn(hdc, SClose(), g_sHover == SH_Close);
 
-    FillRoundAA(hdc, RR(SX(12), SX(56), SX(kUiW - 24), SX(98)), (float)SX(12), C_PANEL);
-    DrawTxt(hdc, g_fontBody, C_TEXT, RR(SX(68), SX(84), SX(260), SX(22)), tr.filter,
+    FillRoundAA(hdc, RR(SX(12), SX(56), SX(kUiW - 24), SX(132)), (float)SX(12), C_PANEL);
+    DrawTxt(hdc, g_fontBody, C_TEXT, RR(SX(68), SX(80), SX(260), SX(22)), tr.filter,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     DrawToggle(hdc, SEnable(), g_settings.enabled, g_sHover == SH_Enable);
-    DrawTxt(hdc, g_fontBody, C_TEXT, RR(SX(68), SX(120), SX(260), SX(22)), tr.autostart,
+    DrawTxt(hdc, g_fontBody, C_TEXT, RR(SX(68), SX(114), SX(260), SX(22)), tr.autostart,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     DrawToggle(hdc, SAuto(), g_settings.autostart, g_sHover == SH_Auto);
-
-    DrawTxt(hdc, g_fontSmall, C_MUTED, RR(SX(20), SX(168), SX(180), SX(16)), tr.sensitivity,
+    DrawTxt(hdc, g_fontBody, C_TEXT, RR(SX(68), SX(148), SX(260), SX(22)), tr.clickFix,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    DrawTxt(hdc, g_fontSmall, C_ACCENT, RR(SX(200), SX(168), SX(160), SX(16)),
+    DrawToggle(hdc, SClick(), g_settings.clickFix, g_sHover == SH_Click);
+
+    DrawTxt(hdc, g_fontSmall, C_MUTED, RR(SX(20), SX(200), SX(180), SX(16)), tr.sensitivity,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    DrawTxt(hdc, g_fontSmall, C_ACCENT, RR(SX(200), SX(200), SX(160), SX(16)),
             g_settings.lang == LangEn ? L"Auto recommended" : L"Авто — рекомендуется",
             DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
     DrawChip(hdc, SSens0(), tr.sensAuto, g_settings.sens == SensAuto, g_sHover == SH_Sens0);
@@ -919,7 +1009,7 @@ void PaintSettings(HWND hwnd) {
     DrawChip(hdc, SSens2(), tr.sensMed, g_settings.sens == SensMedium, g_sHover == SH_Sens2);
     DrawChip(hdc, SSens3(), tr.sensAgg, g_settings.sens == SensAggressive, g_sHover == SH_Sens3);
 
-    DrawTxt(hdc, g_fontSmall, C_MUTED, RR(SX(20), SX(222), SX(100), SX(16)), tr.language,
+    DrawTxt(hdc, g_fontSmall, C_MUTED, RR(SX(20), SX(258), SX(100), SX(16)), tr.language,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     DrawChip(hdc, SLangRu(), L"RU", g_settings.lang == LangRu, g_sHover == SH_LangRu);
     DrawChip(hdc, SLangEn(), L"EN", g_settings.lang == LangEn, g_sHover == SH_LangEn);
@@ -983,6 +1073,12 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             return 0;
         }
         if (h == SH_Auto) { g_settings.autostart = !g_settings.autostart; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
+        if (h == SH_Click) {
+            g_settings.clickFix = !g_settings.clickFix;
+            ApplyRuntime();
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
         if (h == SH_Sens0) { g_settings.sens = SensAuto; ApplyRuntime(); InvalidateRect(hwnd, nullptr, FALSE); return 0; }
         if (h == SH_Sens1) { g_settings.sens = SensSoft; ApplyRuntime(); InvalidateRect(hwnd, nullptr, FALSE); return 0; }
         if (h == SH_Sens2) { g_settings.sens = SensMedium; ApplyRuntime(); InvalidateRect(hwnd, nullptr, FALSE); return 0; }
@@ -1082,8 +1178,8 @@ void PaintDiag(HWND hwnd) {
     const unsigned long long raw = g_raw.load();
     const unsigned long long sup = g_suppressed.load();
     const double pct = raw ? (100.0 * (double)sup / (double)raw) : 0.0;
-    WFormat(a, 160, L"всего %llu    удалено %llu (%.1f%%)    pass %llu    reverse-ok %llu",
-            raw, sup, pct, g_passed.load(), g_reversed.load());
+    WFormat(a, 160, L"wheel raw %llu  drop %llu (%.1f%%)  pass %llu  rev %llu  click-drop %llu",
+            raw, sup, pct, g_passed.load(), g_reversed.load(), g_clickSuppressed.load());
     WFormat(b, 160, L"avg interval %u ms    max~ %u ms    adapt samples %u    false-burst~ %u",
             g_avgInterval, g_maxInterval, g_adaptSamples, g_falseBurstLens);
     DrawTxt(hdc, g_fontMono, C_TEXT, RR(36, 236, 530, 22), a, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
@@ -1156,7 +1252,7 @@ void ShowTrayMenu(HWND hwnd) {
     const UiText& tr = T();
     HMENU menu = CreatePopupMenu();
     wchar_t ver[64]{};
-    WFormat(ver, 64, L"ScrollFix v%s", kAppVersion);
+    WFormat(ver, 64, L"ScrollFix v%ls", kAppVersion);
     AppendMenuW(menu, MF_STRING | MF_GRAYED, ID_VERSION, ver);
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, ID_TOGGLE, g_settings.enabled ? tr.trayOff : tr.trayOn);
